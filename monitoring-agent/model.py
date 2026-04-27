@@ -9,7 +9,7 @@ from mesa import Model
 from mesa.datacollection import DataCollector
 from agents import AGVAgent, RobotAgent
 from buffers import Buffer
-from monitoring import StationKPI, StationMonitor, FactoryMonitor, FactoryKPI
+from monitoring_agent import IslandKPI, IslandMonitor, FactoryKPI, FactoryMonitor
 from factory import FactoryController
 from orders import OrderNode, TaskToken
 import json
@@ -17,16 +17,28 @@ from pathlib import Path
 
 
 class HolonicSchedulingModel(Model):
-    def __init__(self, seed: int = 42, n_orders: int = 10, max_steps: int = 600):
+    def __init__(
+        self,
+        seed: int = 42,
+        n_orders: int = 10,
+        max_steps: int = 600,
+        idm_tolerance: float = 0.25,
+        idm_penalty_scale: float = 1.0,
+    ):
         super().__init__(seed=seed)
         self.random = random.Random(seed)
         self.max_steps = max_steps
+        self.idm_tolerance = idm_tolerance
+        self.idm_penalty_scale = idm_penalty_scale
         self.mission_length = max_steps
         self.robot_mission_length = max(12, max_steps // 4)
-        self.robot_resequence_threshold = 0.90
-        self.robot_resequence_drop = 0.02
-        self.robot_support_threshold = 0.88
-        self.robot_critical_threshold = 0.78
+        self.robot_resequence_threshold = 0.82
+        self.robot_resequence_drop = 0.06
+        self.robot_resequence_cooldown = 8
+        self.robot_resequence_penalty = 0.25
+        self.robot_resequence_penalty_cooldown = 4
+        self.robot_support_threshold = 0.80
+        self.robot_critical_threshold = 0.72
         self.robot_support_cooldown = 6
         self.robot_forecast_horizon = 8
         self.robot_forecast_late_ratio = 0.35
@@ -49,6 +61,7 @@ class HolonicSchedulingModel(Model):
         self._last_factory_replan_step: int | None = None
         self.support_requests: dict[int, list[int]] = {}
         self.robot_resequence_events: list[tuple[int, int]] = []
+        self.robot_resequence_penalty_steps: dict[int, int] = {}
         self.robot_mission_reset_events: list[tuple[int, int]] = []
         self.station_reschedule_events: list[tuple[int, int, str]] = []
         self.station_replan_events: list[tuple[int, int]] = []
@@ -65,11 +78,17 @@ class HolonicSchedulingModel(Model):
         self.log_path = Path("sim_step_log.jsonl")
         self.log_path.write_text("", encoding="utf-8")
 
-        self.station_monitors: dict[int, StationMonitor] = {}
-        self.station_idm: dict[int, float] = {}
-        self.station_kpi: dict[int, StationKPI] = {}
+        self.island_monitors: dict[int, IslandMonitor] = {}
+        self.island_idm: dict[int, float] = {}
+        self.island_kpi: dict[int, IslandKPI] = {}
+        self.station_monitors = self.island_monitors
+        self.station_idm = self.island_idm
+        self.station_kpi = self.island_kpi
 
-        self.factory_monitor = FactoryMonitor()
+        self.factory_monitor = FactoryMonitor(
+            tolerance_pct=self.idm_tolerance,
+            penalty_scale=self.idm_penalty_scale * 0.45,
+        )
         self.factory_idm = 1.0
         self.factory_kpi = FactoryKPI()
 
@@ -83,22 +102,19 @@ class HolonicSchedulingModel(Model):
         self.completed_tokens = 0
         self.token_completion_times: List[int] = []
 
-        self.station_ids = [1, 2]
-        self.station_skills = {1: {"SE", "FE"}, 2: {"FE"}}
+        self.station_ids = [1]
+        self.island_ids = self.station_ids
+        self.station_skills = {1: {"SE", "FE"}}
         robot_specs = [
             (1, ["JOIN", "RIVET", "BOLT", "SE", "FE"], 1.00, 1),
             (2, ["SEAL", "CHECK", "BOLT", "SE", "FE"], 0.95, 1),
-            (3, ["JOIN", "SEAL", "BOLT", "FE"], 0.98, 2),
-            (4, ["RIVET", "CHECK", "BOLT", "FE"], 0.92, 2),
-            (5, ["JOIN", "RIVET", "SEAL", "SE", "FE"], 1.00, 1),
-            (6, ["CHECK", "BOLT", "SEAL", "SE", "FE"], 0.96, 1),
-            (7, ["JOIN", "BOLT", "CHECK", "FE"], 0.98, 2),
-            (8, ["RIVET", "SEAL", "CHECK", "FE"], 0.93, 2),
+            (3, ["JOIN", "SEAL", "BOLT", "FE"], 0.98, 1),
         ]
         self.robots: List[RobotAgent] = []
         for rid, skills, speed, station_id in robot_specs:
             robot = RobotAgent(self, rid, skills, speed, station_id)
             robot.monitor.idm.reset(self.robot_mission_length)
+            robot.monitor.idm.penalty_scale = self.idm_penalty_scale * 0.7
             self.robots.append(robot)
 
         self.agv = AGVAgent(self, 100, travel_time=2)
@@ -109,11 +125,14 @@ class HolonicSchedulingModel(Model):
         self._build_planned_completions()
         self.mission_length = self._compute_planned_makespan() or self.max_steps
         for sid in self.station_ids:
-            mon = StationMonitor()
-            mon.idm.reset(self.mission_length)
-            self.station_monitors[sid] = mon
-            self.station_idm[sid] = 1.0
-            self.station_kpi[sid] = StationKPI()
+            monitor = IslandMonitor(
+                tolerance_pct=self.idm_tolerance,
+                penalty_scale=self.idm_penalty_scale,
+            )
+            monitor.idm.reset(self.mission_length)
+            self.island_monitors[sid] = monitor
+            self.island_idm[sid] = 1.0
+            self.island_kpi[sid] = IslandKPI()
             self._last_station_idm[sid] = 1.0
             self.support_requests[sid] = []
 
@@ -125,6 +144,7 @@ class HolonicSchedulingModel(Model):
                 "step": lambda m: m.steps,
                 "completed_tokens": lambda m: m.completed_tokens,
                 "factory_idm": lambda m: m.factory_idm,
+                "avg_island_idm": lambda m: statistics.fmean(m.island_idm.values()) if m.island_idm else 1.0,
                 "avg_station_idm": lambda m: statistics.fmean(m.station_idm.values()) if m.station_idm else 1.0,
                 "avg_robot_idm": lambda m: statistics.fmean(r.current_idm for r in m.robots),
             }
@@ -486,7 +506,7 @@ class HolonicSchedulingModel(Model):
                     self._last_station_forecast_step = self.steps
 
     def _forecast_idm_breach(self, station_id: int, horizon=10, threshold=0.9):
-        hist = self.station_monitors[station_id].history
+        hist = self.island_monitors[station_id].history
         if len(hist) < 5:
             return False
         recent = [h["idm"] for h in hist[-5:]]
@@ -600,11 +620,8 @@ class HolonicSchedulingModel(Model):
         key = (order_id, stage)
         if key in self.stage_station_assignment:
             return self.stage_station_assignment[key]
-        # default mapping: SE -> station 1 (can do SE/FE), FE -> station 2 (FE only)
-        if stage == "FE":
-            station_id = 2
-        else:
-            station_id = 1
+        # single-station setup: all stages map to station 1
+        station_id = 1
         self.stage_station_assignment[key] = station_id
         return station_id
 
@@ -646,9 +663,9 @@ class HolonicSchedulingModel(Model):
         self._dispatch_station_buffers()
         self._negotiate_station_robots()
         for sid in self.station_ids:
-            kpi, idm = self.station_monitors[sid].evaluate(self, station_id=sid)
-            self.station_kpi[sid] = kpi
-            self.station_idm[sid] = idm
+            kpi, idm = self.island_monitors[sid].evaluate(self, island_id=sid)
+            self.island_kpi[sid] = kpi
+            self.island_idm[sid] = idm
         self.factory_kpi, self.factory_idm = self.factory_monitor.evaluate(self)
         self._forecast_and_intervene()
         self._handle_support_requests()
@@ -677,15 +694,15 @@ class HolonicSchedulingModel(Model):
         lines.append(f"Factory backlog: {self.factory_kpi.backlog}, tardiness_mean={self.factory_kpi.tardiness_mean:.2f}")
         lines.append(f"Factory availability: {self.factory_kpi.availability:.3f}")
         lines.append(f"Resequence events: {len(self.robot_resequence_events)}")
-        lines.append(f"Station replans: {len(self.station_replan_events)}")
+        lines.append(f"Island replans: {len(self.station_replan_events)}")
 
-        lines.append("\nStation details:")
+        lines.append("\nIsland details:")
         for sid in self.station_ids:
-            kpi = self.station_kpi[sid]
+            kpi = self.island_kpi[sid]
             lines.append(
-                "  Station {0} -> IDM={1:.3f}, backlog={2}, tardiness_mean={3:.2f}, availability={4:.2f}".format(
+                "  Island {0} -> IDM={1:.3f}, backlog={2}, tardiness_mean={3:.2f}, availability={4:.2f}".format(
                     sid,
-                    self.station_idm[sid],
+                    self.island_idm[sid],
                     kpi.backlog,
                     kpi.tardiness_mean,
                     kpi.availability,
@@ -808,11 +825,11 @@ class HolonicSchedulingModel(Model):
             t.nominal_finish_target = clock
 
         self.mission_epoch = now
-        self.station_idm[station_id] = 1.0
-        self.station_monitors[station_id]._last_backlog = 0
-        self.station_monitors[station_id].idm.reset(self.mission_length)
+        self.island_idm[station_id] = 1.0
+        self.island_monitors[station_id]._last_backlog = 0
+        self.island_monitors[station_id].idm.reset(self.mission_length)
         self.station_replan_events.append((self.steps, station_id))
-        # station-level replan implies suborder replan on robots
+        # island-level replan implies suborder replan on robots
         station_robots = self.robots_for_station(station_id)
         self._reschedule_robots(station_robots)
         for r in station_robots:
@@ -1001,10 +1018,15 @@ class HolonicSchedulingModel(Model):
     # -------------------------
     def log_robot_resequence(self, robot_id: int):
         self.robot_resequence_events.append((self.steps, robot_id))
-        # penalize robot IDM for violating plan
+        last_penalty_step = self.robot_resequence_penalty_steps.get(robot_id, -10_000)
+        if self.steps - last_penalty_step < self.robot_resequence_penalty_cooldown:
+            return
+
+        # Penalize resequencing, but not so aggressively that one busy robot is forced to zero.
         for r in self.robots:
             if r.robot_id == robot_id:
-                r.monitor.idm.add_penalty(1.6)
+                r.monitor.idm.add_penalty(self.robot_resequence_penalty)
+                self.robot_resequence_penalty_steps[robot_id] = self.steps
                 break
 
     def log_token_event(self, token: TaskToken):
@@ -1026,13 +1048,13 @@ class HolonicSchedulingModel(Model):
                 "tardiness_mean": self.factory_kpi.tardiness_mean,
                 "availability": self.factory_kpi.availability,
             },
-            "stations": [
+            "islands": [
                 {
                     "id": sid,
-                    "idm": self.station_idm[sid],
-                    "backlog": self.station_kpi[sid].backlog,
-                    "tardiness_mean": self.station_kpi[sid].tardiness_mean,
-                    "availability": self.station_kpi[sid].availability,
+                    "idm": self.island_idm[sid],
+                    "backlog": self.island_kpi[sid].backlog,
+                    "tardiness_mean": self.island_kpi[sid].tardiness_mean,
+                    "availability": self.island_kpi[sid].availability,
                     "buffer_in": len(self.station_input_buffers[sid]),
                     "buffer_out": len(self.station_output_buffers[sid]),
                 }
@@ -1064,15 +1086,10 @@ class HolonicSchedulingModel(Model):
         robot_positions = {
             1: (4, 5),
             2: (6, 5),
-            3: (4, 3),
-            4: (6, 3),
-            5: (12, 5),
-            6: (14, 5),
-            7: (12, 3),
-            8: (14, 3),
+            3: (5, 3),
         }
-        station_in = {1: (2, 4), 2: (10, 4)}
-        station_out = {1: (7, 4), 2: (15, 4)}
+        station_in = {1: (2, 4)}
+        station_out = {1: (7, 4)}
         supplier_in = (1, 7)
         last = {}
         for e in self.token_events:
@@ -1121,4 +1138,3 @@ class HolonicSchedulingModel(Model):
                 sout = station_out.get(token.station_id or 1, (7, 4)) if token else (7, 4)
                 tokens.append({"id": tid, "x": sout[0], "y": sout[1], "state": state})
         return tokens
-

@@ -7,7 +7,7 @@ if TYPE_CHECKING:
 
 
 class FactoryController:
-    """Higher-level holon controlling station mission resets and container reschedules."""
+    """Higher-level holon controlling island mission resets and container reschedules."""
 
     def __init__(self, model: "HolonicSchedulingModel"):
         self.model = model
@@ -37,7 +37,7 @@ class FactoryController:
 
             cant_help = m.station_idm[sid] < m.station_support_critical or (recent_reschedule and drop > 0.0)
             if cant_help:
-                # factory tries to move FE containers to station 1 before forcing a replan
+                # Factory tries to move FE containers to island 1 before forcing a replan.
                 if sid == 2 and m.station_idm.get(1, 1.0) > m.station_support_critical:
                     m._factory_reschedule_stages(source_station=2, target_station=1, max_orders=2)
                 else:

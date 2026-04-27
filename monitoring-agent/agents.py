@@ -6,7 +6,7 @@ from typing import Deque, Optional, TYPE_CHECKING
 
 from mesa import Agent
 
-from monitoring import ResourceKPI, RobotMonitor
+from monitoring_agent import MachineKPI, MachineMonitor
 from orders import TaskToken
 from buffers import Buffer
 
@@ -32,9 +32,14 @@ class RobotAgent(Agent):
         self.completed_count = 0
         self.completed_lateness_sum = 0.0
         self.waiting_samples: list[float] = []
-        self.monitor = RobotMonitor(robot_id)
+        self.machine_monitor = MachineMonitor(
+            robot_id,
+            tolerance_pct=model.idm_tolerance,
+            penalty_scale=model.idm_penalty_scale,
+        )
+        self.monitor = self.machine_monitor
         self.current_idm = 1.0
-        self.current_kpi = ResourceKPI()
+        self.current_kpi = MachineKPI()
         self.down_steps = 0
         self.down_remaining = 0
         self.failure_rate = 0.006
@@ -43,6 +48,7 @@ class RobotAgent(Agent):
         self.override_plan_steps = 0
         self.hold_steps = 0
         self.last_trade_step = -999
+        self.last_resequence_step = -999
 
     def accepts(self, task: TaskToken) -> bool:
         return task.required_skill in self.skills
@@ -128,13 +134,13 @@ class RobotAgent(Agent):
         if self.down_remaining > 0:
             self.down_steps += 1
             self.down_remaining -= 1
-            self.current_kpi, self.current_idm = self.monitor.evaluate(self.model, self)
+            self.current_kpi, self.current_idm = self.machine_monitor.evaluate(self.model, self)
             return
 
         if self.model.random.random() < self.failure_rate:
             self.down_remaining = self.model.random.randint(*self.repair_time_range)
             self.down_steps += 1
-            self.current_kpi, self.current_idm = self.monitor.evaluate(self.model, self)
+            self.current_kpi, self.current_idm = self.machine_monitor.evaluate(self.model, self)
             return
 
         self.start_next()
@@ -143,22 +149,22 @@ class RobotAgent(Agent):
             self.remaining -= 1
             if self.remaining <= 0:
                 self.finish_current()
-        self.current_kpi, self.current_idm = self.monitor.evaluate(self.model, self)
+        self.current_kpi, self.current_idm = self.machine_monitor.evaluate(self.model, self)
 
-        if self._idm_drop_too_fast() or self.current_idm < self.model.robot_resequence_threshold:
-            self.resequence_queue()
-            self.override_plan_steps = max(self.override_plan_steps, 2)
-        elif self._forecast_trouble():
-            self.resequence_queue()
-            self.override_plan_steps = max(self.override_plan_steps, 2)
+        decision = self.machine_monitor.last_decision
+        resequence_allowed = self.model.steps - self.last_resequence_step >= self.model.robot_resequence_cooldown
+        if resequence_allowed and decision.recommend_self_resequence:
+            if self.resequence_queue():
+                self.override_plan_steps = max(self.override_plan_steps, decision.override_plan_steps)
 
-        if self.current_idm < self.model.robot_support_threshold:
+        if decision.request_support:
             if self.model.steps - self.last_support_step >= self.model.robot_support_cooldown:
                 self.model.register_support_request(self.robot_id)
 
-    def resequence_queue(self):
+    def resequence_queue(self) -> bool:
         if len(self.queue) < 2:
-            return
+            return False
+        old_order = [t.token_id for t in self.queue]
         # prioritize tasks already at station (transport done) and earlier due
         tasks = sorted(
             self.queue,
@@ -169,8 +175,13 @@ class RobotAgent(Agent):
                 t.token_id,
             ),
         )
+        new_order = [t.token_id for t in tasks]
+        if new_order == old_order:
+            return False
         self.queue = deque(tasks)
+        self.last_resequence_step = self.model.steps
         self.model.log_robot_resequence(self.robot_id)
+        return True
 
     def _idm_drop_too_fast(self) -> bool:
         hist = self.monitor.history
